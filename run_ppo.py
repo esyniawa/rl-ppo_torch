@@ -232,7 +232,10 @@ if __name__ == "__main__":
 
     # init model
     ppo = PPO("CartPole-v1", n_workers, T, m, k, device=device)
-    ppo.train(num_episodes=250)
+    ppo.train(num_episodes=5_000)
 
     # Display the trained agent
-    ppo.display_trained_agent()
+    # ppo.display_trained_agent()
+
+    # Save the model
+    ppo.save_network(f"results/params_n_workers_{n_workers}_T_{T}_m_{m}_k_{k}/ppo_model.pth")
