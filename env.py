@@ -1,6 +1,5 @@
 import gym
-import numpy as np
-
+import torch
 
 # TODO: Make this class more general and implement other environments like Atari Env or others
 class GymEnvironment:
@@ -13,12 +12,12 @@ class GymEnvironment:
         else:
             self.env = gym.make(env_name)
 
-    def reset(self):
+    def reset(self, device: torch.device = "cpu"):
         """Reset the environment and return the initial state."""
         initial_state, _ = self.env.reset()
-        return np.array(initial_state)
+        return torch.as_tensor(initial_state, device=device)
 
-    def step(self, action):
+    def step(self, action, device: torch.device = "cpu"):
         """
         Take a step in the environment.
 
@@ -26,7 +25,7 @@ class GymEnvironment:
         :return: next_state, reward, done
         """
         next_state, reward, done, _, _ = self.env.step(action)
-        return np.array(next_state), reward, done
+        return torch.as_tensor(next_state, device=device), reward, done
 
     def render(self):
         """Render the environment."""

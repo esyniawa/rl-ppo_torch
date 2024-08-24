@@ -10,15 +10,17 @@ import torch.multiprocessing as mp
 from torch.multiprocessing import Pool, freeze_support
 from torch.distributions import Categorical
 # Set the number of threads PyTorch will use
-torch.set_num_threads(8)
+torch.set_num_threads(4)
 
-from dnn import ActorCriticLinear
+from networks import ActorLinear, CriticLinear
 from env import GymEnvironment
+from replay_buffer import ReplayBuffer
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)  # Ignore numpy deprecation warnings if numpy version > 1.24
 
-# TODO: Give a certain neural network architecture as argument to class
+
+# TODO: transfer the neural network of the Actor Critcs to the PPO class instead of initializing it in the class.
 class PPO:
     def __init__(self,
                  env_name: str,
@@ -38,10 +40,13 @@ class PPO:
         self.state_dim = self.dummy_env.state_shape[0]
         self.action_dim = self.dummy_env.num_actions
 
+        # init networks
         self.device = device
-        self.actor_critic = ActorCriticLinear(self.state_dim, self.action_dim).to(self.device)
-        self.actor_optimizer = optim.Adam(self.actor_critic.actor.parameters(), lr=actor_lr)
-        self.critic_optimizer = optim.Adam(self.actor_critic.critic.parameters(), lr=critic_lr)
+        self.actor = ActorLinear(self.state_dim, self.action_dim).to(self.device)
+        self.critic = CriticLinear(self.state_dim).to(self.device)
+
+        self.actor_optimizer = optim.Adam(self.actor.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = optim.Adam(self.critic.critic.parameters(), lr=critic_lr)
 
         self.n_workers = n_workers
         self.T = num_transitions
@@ -50,30 +55,22 @@ class PPO:
         self.gamma = gamma
         self.epsilon = epsilon
 
-    @staticmethod
-    def worker(env_name: str,
-               actor_critic: nn.Module,
-               device: str,
-               T: int):
+        self.replay_buffer = ReplayBuffer(capacity=self.T * self.n_workers,
+                                          state_dim=self.state_dim,
+                                          action_dim=self.action_dim,
+                                          device=self.device)
 
-        env = GymEnvironment(env_name)  # Create an instance of the environment
-        transitions = []
+    def worker(self):
+        env = GymEnvironment(self.env_name)  # Create an instance of the environment
         state = env.reset()
 
-        for _ in range(T):
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-            action_probs, state_value = actor_critic(state_tensor)
+        for _ in range(self.T):
+            action_probs = self.actor(state)
             action_dist = Categorical(action_probs)
             action = action_dist.sample()
 
             next_state, reward, done = env.step(action.item())
-
-            transitions.append(
-                (state, action.item(),
-                 reward, next_state,
-                 done, action_probs.cpu().detach(),
-                 state_value.cpu().detach())
-            )
+            self.replay_buffer.add(state, action, reward, next_state, done, action_dist.log_prob(action))
 
             if done:
                 state = env.reset()
@@ -81,79 +78,64 @@ class PPO:
                 state = next_state
 
         env.close()
-        return transitions
 
-    def collect_transitions(self, multiprocessing: bool = False):
+    def collect_transitions(self, multiprocessing: bool = True):
         if multiprocessing:
-            mp.set_start_method('spawn', force=True)  # This is important for CUDA tensors
-            with Pool(self.n_workers) as p:
-                results = p.starmap(self.worker, [(self.env_name, self.actor_critic, self.device, self.T)] * self.n_workers)
+            processes = []
+            for i in range(self.n_workers):
+                p = mp.Process(target=self.worker)
+                p.start()
+                processes.append(p)
 
-            all_transitions = []
-            for worker_transitions in results:
-                all_transitions.extend(worker_transitions)
-
-            return all_transitions
-
+            for p in processes:
+                p.join()
         else:
-            all_transitions = []
             for _ in range(self.n_workers):
-                transitions = self.worker(self.env_name, self.actor_critic, self.device, self.T)
-                all_transitions.extend(transitions)
-            return all_transitions
+                self.worker()
 
-    def compute_advantages(self, transitions: list):
-        advantages = []
-        returns = []
+    def compute_advantages(self, gae_lambda: float = 0.95):
+        states, actions, rewards, next_states, dones, _ = self.replay_buffer.get_all()
 
-        for t in reversed(range(len(transitions))):
-            state, _, reward, next_state, done, _, state_value = transitions[t]
-            if t == len(transitions) - 1:
-                next_value = 0 if done else \
-                self.actor_critic(torch.FloatTensor(next_state).unsqueeze(0).to(self.device))[1].cpu().item()
-            else:
-                next_value = transitions[t + 1][6].item()
+        with torch.no_grad():
+            state_values = self.critic(states)
+            next_state_values = self.critic(next_states)
 
-            td_error = reward + self.gamma * next_value * (1 - done) - state_value.item()
-            advantages.insert(0, td_error)
-            returns.insert(0, td_error + state_value.item())
+        # Compute TD errors
+        td_errors = rewards + self.gamma * next_state_values * (1 - dones) - state_values
 
-        advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+        # Compute advantages
+        advantages = td_errors.clone()
+        for t in reversed(range(len(self.replay_buffer) - 1)):
+            advantages[t] += self.gamma * gae_lambda * advantages[t + 1] * (1 - dones[t])
+
+        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
 
-        return advantages, returns
+        # Compute returns
+        returns = advantages + state_values
 
-    def update(self,
-               transitions: list,
-               advantages: torch.Tensor,
-               returns: torch.Tensor):
+        self.replay_buffer.advantages[:len(self.replay_buffer)] = advantages
+        self.replay_buffer.returns[:len(self.replay_buffer)] = returns
 
-        states = torch.FloatTensor(np.array([t[0] for t in transitions])).to(self.device)
-        actions = torch.LongTensor(np.array([t[1] for t in transitions])).to(self.device)
-        old_action_probs = torch.cat([t[5] for t in transitions]).to(self.device)
+    def update(self, batch_size: int):
+        self.compute_advantages()
 
         for _ in range(self.k):
-            indices = torch.randperm(len(transitions))[:self.m]
+            states, actions, _, _, _, old_action_probs, advantages, returns = self.replay_buffer.sample(batch_size)
 
-            sampled_states = states[indices]
-            sampled_actions = actions[indices]
-            sampled_advantages = advantages[indices]
-            sampled_returns = returns[indices]
-            sampled_old_action_probs = old_action_probs[indices]
-
-            new_action_probs, state_values = self.actor_critic(sampled_states)
+            # Compute new actor and critic states
+            new_action_probs = self.actor(states)
             new_action_dist = Categorical(new_action_probs)
+            state_values = self.critic(states)
 
             # Actor loss
-            ratio = torch.exp(new_action_dist.log_prob(sampled_actions) - torch.log(
-                sampled_old_action_probs.gather(1, sampled_actions.unsqueeze(1)).squeeze()))
-            surrogate1 = ratio * sampled_advantages
-            surrogate2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * sampled_advantages
+            ratio = torch.exp(new_action_dist.log_prob(new_action_dist.sample()) - old_action_probs)
+            surrogate1 = ratio * advantages
+            surrogate2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
             actor_loss = -torch.min(surrogate1, surrogate2).mean()
 
             # Critic loss
-            critic_loss = nn.MSELoss()(state_values.squeeze(), sampled_returns)
+            critic_loss = nn.MSELoss()(state_values.squeeze(), returns.squeeze())
 
             # Update actor and critic
             self.actor_optimizer.zero_grad()
@@ -165,22 +147,28 @@ class PPO:
 
     def train(self, num_episodes: int):
         for episode in range(num_episodes):
-            transitions = self.collect_transitions()
-            advantages, returns = self.compute_advantages(transitions)
-            self.update(transitions, advantages, returns)
+            self.collect_transitions()
+            self.update(self.m)
 
             if (episode + 1) % 10 == 0:
                 print(f"Episode {episode + 1} completed")
 
-    def save_network(self, path: str):
-        folder = os.path.dirname(path)
-        if not os.path.exists(folder):
-            os.makedirs(folder)
+    def save_networks(self, path: str):
+        if path[-1] != '/':
+            path += '/'
 
-        torch.save(self.actor_critic.state_dict(), path)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        torch.save(self.actor.state_dict(), path + 'ppo_actor.pth')
+        torch.save(self.critic.state_dict(), path + 'ppo_critic.pth')
 
     def load_network(self, path: str):
-        self.actor_critic.load_state_dict(torch.load(path))
+        if path[-1] != '/':
+            path += '/'
+
+        self.actor.load_state_dict(torch.load(path + 'ppo_actor.pth'))
+        self.critic.load_state_dict(torch.load(path + 'ppo_critic.pth'))
 
     def display_trained_agent(self,
                               num_episodes: int = 5,
@@ -196,8 +184,8 @@ class PPO:
 
             while not done and step < max_steps:
                 self.dummy_env.render()
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                action_probs, _ = self.actor_critic(state_tensor)
+                action_probs = self.actor(state)
+
                 action_dist = Categorical(action_probs)
                 action = action_dist.sample()
 
@@ -232,10 +220,10 @@ if __name__ == "__main__":
 
     # init model
     ppo = PPO("CartPole-v1", n_workers, T, m, k, device=device)
-    ppo.train(num_episodes=5_000)
+    ppo.train(num_episodes=500)
 
     # Display the trained agent
-    # ppo.display_trained_agent()
+    ppo.display_trained_agent()
 
     # Save the model
-    ppo.save_network(f"results/params_n_workers_{n_workers}_T_{T}_m_{m}_k_{k}/ppo_model.pth")
+    ppo.save_networks(f"results/params_n_workers_{n_workers}_T_{T}_m_{m}_k_{k}/ppo_model.pth")

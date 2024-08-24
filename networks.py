@@ -2,11 +2,10 @@ import torch
 import torch.nn as nn
 
 
-class ActorCriticLinear(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(ActorCriticLinear, self).__init__()
+class ActorLinear(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int):
+        super(ActorLinear, self).__init__()
 
-        # Actor
         self.actor = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.Tanh(),
@@ -16,7 +15,15 @@ class ActorCriticLinear(nn.Module):
             nn.Softmax(dim=-1)
         )
 
-        # Critic
+    def forward(self, state: torch.Tensor):
+        action_probs = self.actor(state)
+        return action_probs
+
+
+class CriticLinear(nn.Module):
+    def __init__(self, state_dim: int):
+        super(CriticLinear, self).__init__()
+
         self.critic = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.Tanh(),
@@ -25,7 +32,6 @@ class ActorCriticLinear(nn.Module):
             nn.Linear(64, 1)
         )
 
-    def forward(self, state):
-        action_probs = self.actor(state)
+    def forward(self, state: torch.Tensor):
         state_value = self.critic(state)
-        return action_probs, state_value
+        return state_value
