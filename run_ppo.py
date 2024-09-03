@@ -267,12 +267,16 @@ if __name__ == "__main__":
     parser.add_argument('--num_transitions', type=int, default=100_000)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--k', type=int, default=1_000)
+    parser.add_argument('--gpu_index', type=int, default=0)
 
     # Parse arguments
     args = parser.parse_args()
 
     # Set the device
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+    if args.gpu_index > 0 and device == 'cuda':
+        torch.cuda.set_device(args.gpu_index)
+
     print(f"Using device: {device}")
 
     train_ppo(env_name=args.env,
