@@ -9,7 +9,7 @@ from torch.multiprocessing import Pool, freeze_support
 from torch.distributions import Categorical
 
 from networks import ActorLinear, CriticLinear
-from env import VectorizedEnvironment
+from env import VectorizedEnvironment, gym
 from replay_buffer import QueuedReplayBuffer
 
 import warnings
@@ -158,7 +158,7 @@ class PPO:
             self.collect_transitions()
             self.update(self.m)  # m is the batch size for updates
 
-            if (episode + 1) % 10 == 0:
+            if (episode + 1) % 1000 == 0:
                 print(f"Episode {episode + 1} completed")
 
     def save_networks(self, path: str):
@@ -183,17 +183,53 @@ class PPO:
                               max_steps: int = 1000):
 
         print("Displaying trained agent...")
-        pass
+        env = gym.make(self.env_name, render_mode="human")
+
+        for episode in range(num_episodes):
+            state, _ = env.reset()
+
+            total_reward = 0
+            done = False
+            step = 0
+
+            while not done and step < max_steps:
+                env.render()
+                action_probs = self.actor(state)
+
+                action_dist = Categorical(action_probs)
+                action = action_dist.sample()
+
+                state, reward, done, _, _ = env.step(action.item())
+                total_reward += reward
+                step += 1
+
+            print(f"Episode {episode + 1} finished with total reward: {total_reward}")
+
+        env.close()
+
 
 def train_ppo(
     env_name: str,
     n_workers: int,
-    num_transitions: int,
-    num_samples: int,
-    k: int,
-    device: torch.device
+    device: torch.device,
+    num_episodes: int,
+    num_transitions: int = 100_000,
+    num_samples: int = 640,
+    k: int = 100,
+    save_network: bool = True
 ):
-    pass
+    ppo_network = PPO(env_name=env_name,
+                      n_workers=n_workers,
+                      num_transitions=num_transitions,
+                      num_samples=num_samples,
+                      k=k,
+                      device=device)
+
+    print(f"Training PPO for {num_episodes} episodes...")
+    ppo_network.train(num_episodes=num_episodes)
+    if save_network:
+        ppo_network.save_networks(path=f"models/ppo_{env_name}_{n_workers}/")
+
 
 def test_ppo(
     env_name: str,
@@ -203,7 +239,19 @@ def test_ppo(
     k: int,
     device: torch.device
 ):
-    pass
+    ppo_network = PPO(env_name=env_name,
+                      n_workers=n_workers,
+                      num_transitions=num_transitions,
+                      num_samples=num_samples,
+                      k=k,
+                      device=device)
+
+    if os.path.isfile(f"models/ppo_{env_name}_{n_workers}/ppo_actor.pth") and os.path.isfile(f"models/ppo_{env_name}_{n_workers}/ppo_critic.pth"):
+        ppo_network.load_network(path=f"models/ppo_{env_name}_{n_workers}/")
+    else:
+        ppo_network.train(num_episodes=1000)
+
+    ppo_network.display_trained_agent(num_episodes=5, max_steps=1000)
 
 
 if __name__ == "__main__":
@@ -213,6 +261,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch model with CUDA/CPU option")
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], default='cpu',
                         help='Device to run the model on (cuda or cpu)')
+    parser.add_argument('--env', type=str, default='CartPole-v1',)
+    parser.add_argument('--num_episodes', type=int, default=100)
+    parser.add_argument('--n_workers', type=int, default=4)
+    parser.add_argument('--num_transitions', type=int, default=100_000)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--k', type=int, default=1_000)
 
     # Parse arguments
     args = parser.parse_args()
@@ -221,23 +275,11 @@ if __name__ == "__main__":
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
     print(f"Using device: {device}")
 
-    n_workers = 4
-    T = 1_000
-    m = 64
-    k = 100
-
-    # init model
-    ppo = PPO(env_name="MountainCar",
-              n_workers=n_workers,
-              num_transitions=T,
-              num_samples=m,
-              k=k,
-              device=device)
-
-    ppo.train(num_episodes=5)
-
-    # Display the trained agent
-    ppo.display_trained_agent()
-
-    # Save the model
-    ppo.save_networks(f"results/params_n_workers_{n_workers}_T_{T}_m_{m}_k_{k}/ppo_model.pth")
+    train_ppo(env_name=args.env,
+              n_workers=args.n_workers,
+              device=device,
+              num_episodes=args.num_episodes,
+              num_transitions=args.num_transitions,
+              k=args.k,
+              num_samples=args.batch_size,
+              save_network=True)
