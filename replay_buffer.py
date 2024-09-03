@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from typing import List, Tuple
 from queue import Queue
 from threading import Thread
@@ -26,7 +27,7 @@ class QueuedReplayBuffer:
         self.queue = Queue()
 
         self.observations = np.zeros((self.capacity, *self.obs_shape), dtype=np.float32)
-        self.actions = np.zeros((self.capacity, *self.action_shape), dtype=np.int8)
+        self.actions = np.zeros((self.capacity, *self.action_shape), dtype=np.uint8)
         self.rewards = np.zeros(self.capacity, dtype=np.float16)
         self.next_observations = np.zeros((self.capacity, *self.obs_shape), dtype=np.float32)
         self.dones = np.zeros(self.capacity, dtype=np.bool_)
@@ -45,17 +46,24 @@ class QueuedReplayBuffer:
         while True:
             obs, action, reward, next_obs, done, log_prob = self.queue.get()
 
-            self.observations[self.position] = obs
-            self.actions[self.position] = action
-            self.rewards[self.position] = reward
-            self.next_observations[self.position] = next_obs
-            self.dones[self.position] = done
-            self.log_probs[self.position] = log_prob
+            # Move tensors to CPU and convert to numpy arrays
+            self.observations[self.position] = self._to_numpy(obs, dtype=np.float32)
+            self.actions[self.position] = self._to_numpy(action, dtype=np.uint8)
+            self.rewards[self.position] = self._to_numpy(reward, dtype=np.float16)
+            self.next_observations[self.position] = self._to_numpy(next_obs, dtype=np.float32)
+            self.dones[self.position] = self._to_numpy(done, dtype=np.bool_)
+            self.log_probs[self.position] = self._to_numpy(log_prob, dtype=np.float16)
 
             self.position = (self.position + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 
             self.queue.task_done()
+
+    @staticmethod
+    def _to_numpy(x, dtype=np.float32):
+        if isinstance(x, torch.Tensor):
+            return x.cpu().numpy().astype(dtype)
+        return np.array(x, dtype=dtype)
 
     def sample(self, batch_size: int) -> Tuple[np.ndarray, ...]:
         indices = np.random.randint(0, self.size, size=batch_size)
