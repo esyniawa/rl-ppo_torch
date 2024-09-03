@@ -1,55 +1,54 @@
 import gym
-import torch
+import numpy as np
+from typing import List, Tuple
 
-# TODO: Make this class more general and implement other environments like Atari Env or others
-class GymEnvironment:
-    def __init__(self,
-                 env_name: str,
-                 show_render: bool = False):
 
-        if show_render:
-            self.env = gym.make(env_name, render_mode="human")
-        else:
-            self.env = gym.make(env_name)
+class VectorizedEnvironment:
+    def __init__(self, env_name: str, num_envs: int):
+        self.envs = [gym.make(env_name) for _ in range(num_envs)]
+        self.num_envs = num_envs
 
-    def reset(self, device: torch.device = "cpu"):
-        """Reset the environment and return the initial state."""
-        initial_state, _ = self.env.reset()
-        return torch.as_tensor(initial_state, device=device)
+        self.observations = self.reset()
 
-    def step(self, action, device: torch.device = "cpu"):
-        """
-        Take a step in the environment.
+    def reset(self) -> np.ndarray:
+        results = [env.reset() for env in self.envs]
+        states, _ = zip(*results)
+        return np.array(states)
 
-        :param action: The action to take
-        :return: next_state, reward, done
-        """
-        next_state, reward, done, _, _ = self.env.step(action)
-        return torch.as_tensor(next_state, device=device), reward, done
+    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        results = [env.step(action) for env, action in zip(self.envs, actions)]
+        new_obs, rewards, dones, _, _ = zip(*results)
 
-    def render(self):
-        """Render the environment."""
-        return self.env.render()
+        new_obs = np.array(new_obs)
+        rewards = np.array(rewards)
+        dones = np.array(dones)
+
+        # Reset environments that have terminated
+        for i, done in enumerate(dones):
+            if done:
+                new_obs[i], _ = self.envs[i].reset()
+
+        self.observations = new_obs
+        return np.array(new_obs), np.array(rewards), np.array(dones)
 
     def close(self):
-        """Close the environment."""
-        self.env.close()
-
-    @property
-    def num_actions(self):
-        """Return the number of possible actions."""
-        return self.env.action_space.n
+        for env in self.envs:
+            env.close()
 
     @property
     def state_shape(self):
-        """Return the shape of the state space."""
-        return self.env.observation_space.shape
+        return self.envs[0].observation_space.shape
+
+    @property
+    def num_actions(self):
+        return self.envs[0].action_space.n
+
+    @property
+    def action_shape(self):
+        if isinstance(self.envs[0].action_space, gym.spaces.discrete.Discrete):
+            return (1,)
 
 if __name__ == "__main__":
-    env = GymEnvironment("CartPole-v1")
-    state = env.reset()
-    print(state)
+    vec_env = VectorizedEnvironment("CartPole-v1", 2)
 
-    print(env.state_shape, env.num_actions)
-
-
+    print(vec_env.state_shape, vec_env.num_actions, vec_env.action_shape)

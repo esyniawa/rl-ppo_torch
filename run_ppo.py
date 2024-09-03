@@ -1,20 +1,16 @@
 import os.path
 import argparse
 
-import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
 from torch.multiprocessing import Pool, freeze_support
 from torch.distributions import Categorical
-# Set the number of threads PyTorch will use
-torch.set_num_threads(4)
 
 from networks import ActorLinear, CriticLinear
-from env import GymEnvironment
-from replay_buffer import ReplayBuffer
+from env import VectorizedEnvironment
+from replay_buffer import QueuedReplayBuffer
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)  # Ignore numpy deprecation warnings if numpy version > 1.24
@@ -32,18 +28,17 @@ class PPO:
                  actor_lr: float = 0.0003,
                  critic_lr: float = 0.001,
                  gamma: float = 0.99,
-                 epsilon: float = 0.2):
+                 epsilon: float = 0.2,
+                 gae_lambda: float = 0.95):
 
+        # Environment
         self.env_name = env_name
-
-        self.dummy_env = GymEnvironment(env_name, show_render=False)
-        self.state_dim = self.dummy_env.state_shape[0]
-        self.action_dim = self.dummy_env.num_actions
+        self.vec_env = VectorizedEnvironment(env_name, n_workers)
 
         # init networks
         self.device = device
-        self.actor = ActorLinear(self.state_dim, self.action_dim).to(self.device)
-        self.critic = CriticLinear(self.state_dim).to(self.device)
+        self.actor = ActorLinear(self.vec_env.state_shape[0], self.vec_env.num_actions).to(self.device)
+        self.critic = CriticLinear(self.vec_env.state_shape[0]).to(self.device)
 
         self.actor_optimizer = optim.Adam(self.actor.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = optim.Adam(self.critic.critic.parameters(), lr=critic_lr)
@@ -54,101 +49,114 @@ class PPO:
         self.k = k
         self.gamma = gamma
         self.epsilon = epsilon
+        self.gae_lambda = gae_lambda
 
-        self.replay_buffer = ReplayBuffer(capacity=self.T * self.n_workers,
-                                          state_dim=self.state_dim,
-                                          action_dim=self.action_dim,
-                                          device=self.device)
+        # Initialize replay buffer
+        self.replay_buffer = QueuedReplayBuffer(
+            capacity=self.T * self.n_workers,
+            obs_shape=self.vec_env.state_shape,
+            action_shape=self.vec_env.action_shape,
+        )
 
-    def worker(self):
-        env = GymEnvironment(self.env_name)  # Create an instance of the environment
-        state = env.reset()
+    def collect_transitions(self):
+        states = self.vec_env.reset()
 
         for _ in range(self.T):
-            action_probs = self.actor(state)
+            # Convert states to tensor and move to device
+            state_tensor = torch.FloatTensor(states).to(self.device)
+
+            # Get action probabilities
+            with torch.no_grad():
+                action_probs = self.actor(state_tensor)
+
+            # Sample actions
             action_dist = Categorical(action_probs)
-            action = action_dist.sample()
+            actions = action_dist.sample()
 
-            next_state, reward, done = env.step(action.item())
-            self.replay_buffer.add(state, action, reward, next_state, done, action_dist.log_prob(action))
+            log_probs = action_dist.log_prob(actions)
 
-            if done:
-                state = env.reset()
-            else:
-                state = next_state
+            # Take steps in environments
+            next_states, rewards, dones = self.vec_env.step(actions.cpu().numpy())
 
-        env.close()
+            # Add transitions to replay buffer
+            for state, action, reward, next_state, done, log_prob in zip(states, actions, rewards, next_states, dones, log_probs):
+                self.replay_buffer.add(state, action, reward, next_state, done, log_prob.item())
 
-    def collect_transitions(self, multiprocessing: bool = True):
-        if multiprocessing:
-            processes = []
-            for i in range(self.n_workers):
-                p = mp.Process(target=self.worker)
-                p.start()
-                processes.append(p)
+            states = next_states
 
-            for p in processes:
-                p.join()
-        else:
-            for _ in range(self.n_workers):
-                self.worker()
-
-    def compute_advantages(self, gae_lambda: float = 0.95):
-        states, actions, rewards, next_states, dones, _ = self.replay_buffer.get_all()
-
+    def compute_advantages(self, states, rewards, next_states, dones):
         with torch.no_grad():
-            state_values = self.critic(states)
-            next_state_values = self.critic(next_states)
+            values = self.critic(states).squeeze()
+            next_values = self.critic(next_states).squeeze()
 
-        # Compute TD errors
-        td_errors = rewards + self.gamma * next_state_values * (1 - dones) - state_values
+        # Calculate TD errors and advantages
+        deltas = rewards + self.gamma * next_values * (1 - dones) - values
+        advantages = torch.zeros_like(rewards)
 
-        # Compute advantages
-        advantages = td_errors.clone()
-        for t in reversed(range(len(self.replay_buffer) - 1)):
-            advantages[t] += self.gamma * gae_lambda * advantages[t + 1] * (1 - dones[t])
+        running_advantage = 0
+        for t in reversed(range(len(rewards))):
+            running_advantage = deltas[t] + self.gamma * self.gae_lambda * running_advantage * (1 - dones[t])
+            advantages[t] = running_advantage
 
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Compute returns
-        returns = advantages + state_values
+        # Calculate returns
+        returns = advantages + values
 
-        self.replay_buffer.advantages[:len(self.replay_buffer)] = advantages
-        self.replay_buffer.returns[:len(self.replay_buffer)] = returns
+        return advantages, returns
 
-    def update(self, batch_size: int):
-        self.compute_advantages()
+    def update(self, batch_size):
+        """
+        Performs a PPO update. Calculating advantages for smaller batches with online updates.
+        :param batch_size: int
+        :return:
+        """
 
         for _ in range(self.k):
-            states, actions, _, _, _, old_action_probs, advantages, returns = self.replay_buffer.sample(batch_size)
+            # Sample a batch from the replay buffer
+            states, actions, rewards, next_states, dones, old_log_probs = self.replay_buffer.sample(batch_size)
 
-            # Compute new actor and critic states
-            new_action_probs = self.actor(states)
-            new_action_dist = Categorical(new_action_probs)
-            state_values = self.critic(states)
+            # Convert to tensors and move to device
+            states = torch.FloatTensor(states).to(self.device)
+            actions = torch.LongTensor(actions).to(self.device)
+            rewards = torch.FloatTensor(rewards).to(self.device)
+            next_states = torch.FloatTensor(next_states).to(self.device)
+            dones = torch.FloatTensor(dones).to(self.device)
+            old_log_probs = torch.FloatTensor(old_log_probs).to(self.device)
 
-            # Actor loss
-            ratio = torch.exp(new_action_dist.log_prob(new_action_dist.sample()) - old_action_probs)
+            # Compute advantages and returns for this batch
+            advantages, returns = self.compute_advantages(states, rewards, next_states, dones)
+
+            # Get current action probabilities and values
+            action_probs = self.actor(states)
+            current_values = self.critic(states).squeeze()
+
+            # Calculate ratio and surrogate objectives
+            dist = Categorical(action_probs)
+            new_log_probs = dist.log_prob(actions)
+            ratio = torch.exp(new_log_probs - old_log_probs)
+
             surrogate1 = ratio * advantages
             surrogate2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
             actor_loss = -torch.min(surrogate1, surrogate2).mean()
 
-            # Critic loss
-            critic_loss = nn.MSELoss()(state_values.squeeze(), returns.squeeze())
+            # Calculate value function loss
+            value_loss = nn.MSELoss()(current_values, returns)
 
             # Update actor and critic
             self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
             actor_loss.backward()
-            critic_loss.backward()
             self.actor_optimizer.step()
+
+            self.critic_optimizer.zero_grad()
+            value_loss.backward()
             self.critic_optimizer.step()
 
-    def train(self, num_episodes: int):
+    def train(self, num_episodes):
         for episode in range(num_episodes):
             self.collect_transitions()
-            self.update(self.m)
+            self.update(self.m)  # m is the batch size for updates
 
             if (episode + 1) % 10 == 0:
                 print(f"Episode {episode + 1} completed")
@@ -175,27 +183,27 @@ class PPO:
                               max_steps: int = 1000):
 
         print("Displaying trained agent...")
-        self.dummy_env = GymEnvironment(self.env_name, show_render=True)
-        for episode in range(num_episodes):
-            state = self.dummy_env.reset()
-            total_reward = 0
-            done = False
-            step = 0
+        pass
 
-            while not done and step < max_steps:
-                self.dummy_env.render()
-                action_probs = self.actor(state)
+def train_ppo(
+    env_name: str,
+    n_workers: int,
+    num_transitions: int,
+    num_samples: int,
+    k: int,
+    device: torch.device
+):
+    pass
 
-                action_dist = Categorical(action_probs)
-                action = action_dist.sample()
-
-                state, reward, done = self.dummy_env.step(action.item())
-                total_reward += reward
-                step += 1
-
-            print(f"Episode {episode + 1} finished with total reward: {total_reward}")
-
-        self.dummy_env.close()
+def test_ppo(
+    env_name: str,
+    n_workers: int,
+    num_transitions: int,
+    num_samples: int,
+    k: int,
+    device: torch.device
+):
+    pass
 
 
 if __name__ == "__main__":
@@ -214,13 +222,19 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     n_workers = 4
-    T = 200
+    T = 1_000
     m = 64
-    k = 10
+    k = 100
 
     # init model
-    ppo = PPO("CartPole-v1", n_workers, T, m, k, device=device)
-    ppo.train(num_episodes=500)
+    ppo = PPO(env_name="MountainCar",
+              n_workers=n_workers,
+              num_transitions=T,
+              num_samples=m,
+              k=k,
+              device=device)
+
+    ppo.train(num_episodes=5)
 
     # Display the trained agent
     ppo.display_trained_agent()
