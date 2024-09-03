@@ -23,7 +23,7 @@ class PPO:
                  n_workers: int,
                  num_transitions: int,
                  num_samples: int,
-                 k: int,
+                 num_epochs: int,
                  device: torch.device,
                  actor_lr: float = 0.0003,
                  critic_lr: float = 0.001,
@@ -46,7 +46,7 @@ class PPO:
         self.n_workers = n_workers
         self.T = num_transitions
         self.m = num_samples
-        self.k = k
+        self.k = num_epochs
         self.gamma = gamma
         self.epsilon = epsilon
         self.gae_lambda = gae_lambda
@@ -158,7 +158,7 @@ class PPO:
             self.collect_transitions()
             self.update(self.m)  # m is the batch size for updates
 
-            if (episode + 1) % 1000 == 0:
+            if (episode + 1) % 100 == 0:
                 print(f"Episode {episode + 1} completed")
 
     def save_networks(self, path: str):
@@ -222,7 +222,7 @@ def train_ppo(
                       n_workers=n_workers,
                       num_transitions=num_transitions,
                       num_samples=num_samples,
-                      k=k,
+                      num_epochs=k,
                       device=device)
 
     print(f"Training PPO for {num_episodes} episodes...")
@@ -243,7 +243,7 @@ def test_ppo(
                       n_workers=n_workers,
                       num_transitions=num_transitions,
                       num_samples=num_samples,
-                      k=k,
+                      num_epochs=k,
                       device=device)
 
     if os.path.isfile(f"models/ppo_{env_name}_{n_workers}/ppo_actor.pth") and os.path.isfile(f"models/ppo_{env_name}_{n_workers}/ppo_critic.pth"):
@@ -262,11 +262,11 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], default='cpu',
                         help='Device to run the model on (cuda or cpu)')
     parser.add_argument('--env', type=str, default='CartPole-v1',)
-    parser.add_argument('--num_episodes', type=int, default=100)
+    parser.add_argument('--n_episodes', type=int, default=100)
     parser.add_argument('--n_workers', type=int, default=4)
-    parser.add_argument('--num_transitions', type=int, default=100_000)
+    parser.add_argument('--n_transitions', type=int, default=2_048)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--k', type=int, default=1_000)
+    parser.add_argument('--n_epochs', type=int, default=16)
     parser.add_argument('--gpu_index', type=int, default=0)
 
     # Parse arguments
@@ -282,8 +282,8 @@ if __name__ == "__main__":
     train_ppo(env_name=args.env,
               n_workers=args.n_workers,
               device=device,
-              num_episodes=args.num_episodes,
-              num_transitions=args.num_transitions,
-              k=args.k,
+              num_episodes=args.n_episodes,
+              num_transitions=args.n_transitions,
+              k=args.n_epochs,
               num_samples=args.batch_size,
               save_network=True)
